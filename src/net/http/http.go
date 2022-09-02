@@ -157,3 +157,13 @@ type Pusher interface {
 	// is not supported on the underlying connection.
 	Push(target string, opts *PushOptions) error
 }
+
+// OriginPusher is the interface implemented by ResponseWriters that support
+// pushing HTTP/2 ORIGIN frames. For more background, see
+// https://datatracker.ietf.org/doc/html/rfc8336
+type OriginPusher interface {
+	// OriginPush takes a list of Origins and contructs an ORIGIN frame and
+	//pushes it to the client. The list of origins need to have the scheme and
+	//the port if it's not 443.
+	OriginPush(origins []string) error
+}

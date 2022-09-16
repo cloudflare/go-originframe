@@ -11,3 +11,5 @@ require (
 	golang.org/x/sys v0.0.0-20220804214406-8e32c043e418 // indirect
 	golang.org/x/text v0.3.8-0.20220722155301-d03b41800055 // indirect
 )
+
+replace golang.org/x/net => ../../net

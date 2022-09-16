@@ -1366,6 +1366,7 @@ const (
 	http2FrameGoAway       http2FrameType = 0x7
 	http2FrameWindowUpdate http2FrameType = 0x8
 	http2FrameContinuation http2FrameType = 0x9
+	http2FrameOrigin       http2FrameType = 0xC
 )
 
 var http2frameName = map[http2FrameType]string{
@@ -1379,6 +1380,7 @@ var http2frameName = map[http2FrameType]string{
 	http2FrameGoAway:       "GOAWAY",
 	http2FrameWindowUpdate: "WINDOW_UPDATE",
 	http2FrameContinuation: "CONTINUATION",
+	http2FrameOrigin:       "ORIGIN",
 }
 
 func (t http2FrameType) String() string {
@@ -1464,6 +1466,7 @@ var http2frameParsers = map[http2FrameType]http2frameParser{
 	http2FrameGoAway:       http2parseGoAwayFrame,
 	http2FrameWindowUpdate: http2parseWindowUpdateFrame,
 	http2FrameContinuation: http2parseContinuationFrame,
+	http2FrameOrigin:       http2parseOriginFrame,
 }
 
 func http2typeFrameParser(t http2FrameType) http2frameParser {
@@ -2597,6 +2600,83 @@ func (f *http2Framer) WriteContinuation(streamID uint32, endHeaders bool, header
 	return f.endWrite()
 }
 
+// An OriginFrame is used to assert authority to serve a domain.
+// See https://datatracker.ietf.org/doc/html/rfc8336
+type http2OriginFrame struct {
+	http2FrameHeader
+	originEntries []http2originEntry
+}
+
+type http2originEntry struct {
+	originLen   uint16
+	asciiOrigin string
+}
+
+func http2parseOriginFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
+	if fh.StreamID != 0 {
+		if http2VerboseLogs {
+			log.Printf("http2: ORIGIN Frame with non-zero stream ID: %d", fh.StreamID)
+		}
+		countError("frame_origin_nonzero_streamid")
+		return nil, http2connError{http2ErrCodeProtocol, "ORIGIN Frame with non-zero stream ID"}
+	}
+
+	if fh.Flags != 0 {
+		if http2VerboseLogs {
+			log.Printf("http2: ORIGIN Frame with unsupported flags: %d", fh.Flags)
+		}
+		countError("frame_origin_unsupported_flag")
+		return nil, http2connError{http2ErrCodeProtocol, "Unsupported flags set"}
+	}
+
+	remain := p
+	origins := make([]http2originEntry, 0)
+
+	for len(remain) > 0 {
+		var v uint16
+		var err error
+		remain, v, err = http2readUint16(remain)
+		if err != nil {
+			if http2VerboseLogs {
+				log.Printf("http2: ORIGIN Frame with unexpected EOF")
+			}
+			countError("frame_origin_eof")
+			return nil, http2connError{http2ErrCodeProtocol, "Unexpected EOF in ORIGIN Frame"}
+		}
+		if len(remain) < int(v) {
+			if http2VerboseLogs {
+				log.Printf("http2: ORIGIN Frame failed to parse correctly")
+			}
+			countError("frame_origin_parse_err")
+			return nil, http2connError{http2ErrCodeProtocol, "Parse Error for ORIGIN Frame"}
+		}
+
+		origin := string(remain[:v])
+		remain = remain[v:]
+
+		origins = append(origins, http2originEntry{v, origin})
+	}
+	return &http2OriginFrame{fh, origins}, nil
+}
+
+func http2readUint16(p []byte) (remain []byte, v uint16, err error) {
+	if len(p) < 2 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	return p[2:], binary.BigEndian.Uint16(p[:2]), nil
+}
+
+// WriteOrigin writes a single ORIGIN frame.
+// It will only perform one write
+func (f *http2Framer) WriteOrigin(origins []string) error {
+	f.startWrite(http2FrameOrigin, 0, 0)
+	for _, origin := range origins {
+		f.writeUint16(uint16(len(origin)))
+		f.wbuf = append(f.wbuf, []byte(origin)...)
+	}
+	return f.endWrite()
+}
+
 // A PushPromiseFrame is used to initiate a server stream.
 // See https://httpwg.org/specs/rfc7540.html#rfc.section.6.6
 type http2PushPromiseFrame struct {
@@ -2976,6 +3056,8 @@ func http2summarizeFrame(f http2Frame) string {
 			f.LastStreamID, f.ErrCode, f.debugData)
 	case *http2RSTStreamFrame:
 		fmt.Fprintf(&buf, " ErrCode=%v", f.ErrCode)
+	case *http2OriginFrame:
+		fmt.Fprintf(&buf, " Origins=%v", f.originEntries)
 	}
 	return buf.String()
 }
@@ -4671,6 +4753,8 @@ func (sc *http2serverConn) serve() {
 				}
 			case *http2startPushRequest:
 				sc.startPush(v)
+			case *http2PushOriginRequest:
+				sc.pushOrigin(v)
 			default:
 				panic(fmt.Sprintf("unexpected type %T", v))
 			}
@@ -5096,9 +5180,6 @@ func (sc *http2serverConn) startGracefulShutdownInternal() {
 func (sc *http2serverConn) goAway(code http2ErrCode) {
 	sc.serveG.check()
 	if sc.inGoAway {
-		if sc.goAwayCode == http2ErrCodeNo {
-			sc.goAwayCode = code
-		}
 		return
 	}
 	sc.inGoAway = true
@@ -6575,6 +6656,51 @@ var (
 
 var _ Pusher = (*http2responseWriter)(nil)
 
+var _ OriginPusher = (*http2responseWriter)(nil)
+
+func (w *http2responseWriter) OriginPush(origins []string) error {
+	st := w.rws.stream
+	sc := st.sc
+	sc.serveG.checkNotOn()
+	tLen := 0
+	checkedOrigins := make([]string, 0)
+	for _, origin := range origins {
+		u, err := url.Parse(origin)
+		if err != nil {
+			return err
+		}
+		ts := url.URL{Scheme: "https", Host: u.Host}
+		if ts.String() != u.String() {
+			continue
+		}
+		tLen += 2 + len(ts.String())
+		checkedOrigins = append(checkedOrigins, ts.String())
+	}
+	msg := &http2PushOriginRequest{
+		origins:          checkedOrigins,
+		originBodyLength: tLen,
+		done:             http2errChanPool.Get().(chan error),
+	}
+
+	select {
+	case <-sc.doneServing:
+		return http2errClientDisconnected
+	case <-st.cw:
+		return http2errStreamClosed
+	case sc.serveMsgCh <- msg:
+	}
+
+	select {
+	case <-sc.doneServing:
+		return http2errClientDisconnected
+	case <-st.cw:
+		return http2errStreamClosed
+	case err := <-msg.done:
+		http2errChanPool.Put(msg.done)
+		return err
+	}
+}
+
 func (w *http2responseWriter) Push(target string, opts *PushOptions) error {
 	st := w.rws.stream
 	sc := st.sc
@@ -6761,6 +6887,25 @@ func (sc *http2serverConn) startPush(msg *http2startPushRequest) {
 		},
 		stream: msg.parent,
 		done:   msg.done,
+	})
+}
+
+type http2PushOriginRequest struct {
+	parent           *http2stream
+	origins          []string
+	done             chan error
+	originBodyLength int
+}
+
+func (sc *http2serverConn) pushOrigin(msg *http2PushOriginRequest) {
+	sc.serveG.check()
+
+	sc.writeFrame(http2FrameWriteRequest{
+		write: http2writeOrigin{
+			origins:          msg.origins,
+			originBodyLength: msg.originBodyLength,
+		},
+		done: msg.done,
 	})
 }
 
@@ -10201,6 +10346,19 @@ func (wu http2writeWindowUpdate) staysWithinBuffer(max int) bool { return http2f
 
 func (wu http2writeWindowUpdate) writeFrame(ctx http2writeContext) error {
 	return ctx.Framer().WriteWindowUpdate(wu.streamID, wu.n)
+}
+
+type http2writeOrigin struct {
+	origins          []string
+	originBodyLength int
+}
+
+func (wo http2writeOrigin) staysWithinBuffer(max int) bool {
+	return http2frameHeaderLen+wo.originBodyLength <= max
+}
+
+func (wo http2writeOrigin) writeFrame(ctx http2writeContext) error {
+	return ctx.Framer().WriteOrigin(wo.origins)
 }
 
 // encodeHeaders encodes an http.Header. If keys is not nil, then (k, h[k])
